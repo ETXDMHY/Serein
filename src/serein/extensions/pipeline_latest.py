@@ -146,6 +146,8 @@ def event_curator_model_input(component: dict[str, Any], snowflake_message_ids: 
         if not source_ids or set(source_ids).difference(context_by_id):
             raise ValueError('Track Curator base Event is missing bound originals')
         base = {'event_id': str(candidate.get('event_id') or candidate.get('item_id') or candidate.get('id') or ''), 'primary_track_id': str(candidate.get('primary_track_id') or candidate.get('track_id') or ''), 'blocking_flags': [flag for flag in EVENT_CURATOR_BLOCKING_BASE_FLAGS if bool(candidate.get(flag))], 'messages': event_track_message_payload([context_by_id[source_id] for source_id in source_ids], snowflake_message_ids)}
+        base['body_chars'] = len(str(candidate.get('body') or ''))
+        base['append_remaining_chars'] = append_remaining_chars(candidate)
         if component.get('writer_material_review') and type(component.get('material_contract_version')) is int and component['material_contract_version'] == 1:
             inherited = pipeline_materials.trusted_materials(candidate, component.get('context_messages') or [])
             base['extend_material_mode'] = 'new_sources_only' if inherited is not None else 'full_sources'
@@ -227,8 +229,9 @@ def build_event_track_curator_prompt(date_view: str, component: dict[str, Any], 
             'action 与 base_event_ids 数量必须匹配：create 为 0，extend/rewrite 恰好为 1，merge 至少为 2；base 只能从输入的 base_events 选择。'
             'extend 只接续输入 base_events 中某一条已保存 Event，base_event_ids 必须恰好填写该 Event 的 event_id；同一 Track 的后续消息不等于 extend。base_events 为空时，拟议 Event 只能用 create，不能用 extend 加空 base。当前 events 数组内刚提出的 create 也不能作为 base；若后续 unit 仍属同一段活动，合入同一个 Event 的 owned_unit_roots，独立活动则分别 create。'
             '接续已保存 Event 时 Writer 仅写新增段落；只有必须整篇重新组织时才显式用 rewrite（一条 base），合并多条已保存 base 用 merge。'
+            'base_events 给出 body_chars 和 append_remaining_chars（已扣除段落间两个换行）；容量为 0 或不足以表达新增内容时，为新增来源 create 后续 Event，沿用同一 primary_track_id，旧来源与旧正文只作背景；不要因为容量限制 rewrite 或 merge 旧 Event。受保护前版仍遵守原有续接开关和保护条件。'
             'parked 直接纠正紧邻 stable 结果时 defer；无关 parked 不影响已落定材料。'
-            'rolling_engineering 逐条核对实际建设，相关 base 全选；受保护前版仍拟议 extend/merge，由 host 按冻结配置检查能否原文后追加，否则暂缓。\n'
+            'rolling_engineering 逐条核对实际建设，相关 base 全选；容量耗尽的前版只作背景，不选入 merge。其他受保护前版仍拟议 extend/merge，由 host 按冻结配置检查能否原文后追加，否则暂缓。\n'
             '整个 corridor 缺少对象、起因或被纠正旧主张时可一次返回 context_request；它与 Event 决定严格二选一，'
             'reason 只允许 missing_subject、missing_origin、missing_prior_claim：\n'
             f'{json.dumps({"context_request":{"track_id":"允许的 track_id","before_message_id":1,"reason":"missing_subject"}}, ensure_ascii=False)}\n'
@@ -457,6 +460,7 @@ def _normalize_expanded_event_curator_output(output: dict[str, Any], component: 
         if not isinstance(predecessor_ids, list) or any((not isinstance(value, str) or not value.strip() for value in predecessor_ids)):
             raise ValueError('Track Curator base predecessor aliases are invalid')
         candidate = {'event_id': event_id, 'primary_track_id': candidate_track_id, 'session_ids': session_ids, 'source_message_ids': source_ids, 'predecessor_event_ids': [str(value).strip() for value in predecessor_ids], 'blocking_flags': [flag for flag in EVENT_CURATOR_BLOCKING_BASE_FLAGS if bool(raw_candidate.get(flag))],
+                     'append_remaining_chars':append_remaining_chars(raw_candidate),
                      'continuation_allowed':bool(component.get('append_protected') and raw_candidate.get('continuation_allowed'))}
         seen_active_base_ids.add(event_id)
         active_base_candidates.append(candidate)
@@ -521,6 +525,10 @@ def _normalize_expanded_event_curator_output(output: dict[str, Any], component: 
             if candidate['primary_track_id'] != primary_track_id:
                 raise ValueError('Track Curator selected a base from another Track')
             selected_candidates.append(candidate)
+        if action in {'rewrite','merge'} and any(
+                candidate['append_remaining_chars'] == 0 for candidate in selected_candidates):
+            raise ValueError('容量耗尽的旧 Event 只作背景，不参与自动 rewrite/merge；'
+                             '请为新增原话 create，或只选择仍有容量的后续 Event 作为 base。')
         if not isinstance(raw_bindings, list) or not raw_bindings:
             raise ValueError('Track Curator Event needs source bindings')
         bindings: list[dict[str, Any]] = []
@@ -547,11 +555,20 @@ def _normalize_expanded_event_curator_output(output: dict[str, Any], component: 
         if any((not candidate['blocking_flags'] for candidate in colliding_candidates)):
             raise ValueError('Track Curator source already belongs to an unselected base')
         blocked_candidates = list({candidate['event_id']: candidate for candidate in [*selected_candidates, *colliding_candidates] if candidate['blocking_flags']}.values())
+        capacity_rollover = (action == 'extend' and len(selected_candidates) == 1
+            and selected_candidates[0]['append_remaining_chars'] == 0 and not colliding_candidates
+            and (not selected_candidates[0]['blocking_flags']
+                 or (selected_candidates[0]['continuation_allowed']
+                     and 'forked' not in selected_candidates[0]['blocking_flags']))
+            and not selected_source_ids.intersection(stable_ids)
+            and any(row['activity_role'] == 'primary_activity'
+                    and row['source_message_id'] not in selected_source_ids for row in bindings))
         append_only = (bool(blocked_candidates) and len(selected_candidates) == 1 and action == 'extend'
+                       and selected_candidates[0]['append_remaining_chars'] > 0
                        and not colliding_candidates and selected_candidates[0]['continuation_allowed']
                        and 'forked' not in selected_candidates[0]['blocking_flags']
                        and any(item['source_message_id'] in stable_ids - selected_source_ids for item in bindings))
-        if append_only:
+        if append_only or capacity_rollover:
             blocked_candidates = []
         if blocked_candidates:
             touched_stable_ids = [item['source_message_id'] for item in bindings if item['source_message_id'] in stable_ids]
@@ -576,6 +593,15 @@ def _normalize_expanded_event_curator_output(output: dict[str, Any], component: 
             held=normalize_disposition(touched,'defer')
             defer=normalize_disposition(list(dict.fromkeys([*defer,*held])),'defer')
             hard_skips.append({'event_ref':event_ref,'reason':'no_new_sources',
+                'requested_base_event_ids':base_event_ids,'active_base_event_ids':normalized_base_ids,
+                'blocking_flags':[],'defer_source_message_ids':held})
+            continue
+        if (action == 'extend' and selected_candidates[0]['append_remaining_chars'] == 0
+                and not capacity_rollover):
+            held=normalize_disposition([row['source_message_id'] for row in bindings
+                                        if row['source_message_id'] in stable_ids],'defer')
+            defer=normalize_disposition(list(dict.fromkeys([*defer,*held])),'defer')
+            hard_skips.append({'event_ref':event_ref,'reason':'capacity_boundary_unresolved',
                 'requested_base_event_ids':base_event_ids,'active_base_event_ids':normalized_base_ids,
                 'blocking_flags':[],'defer_source_message_ids':held})
             continue
@@ -661,7 +687,35 @@ def normalize_event_curator_output(output: dict[str, Any], component: dict[str, 
     pipeline_materials.attach(review, output, normalized, component)
     normalized['event_admissions'] = pipeline_admission.validate(review, output, component)
     normalized['decision_review'] = review
+    # Finish validating the model's full ownership/material receipt before
+    # changing an impossible append. The inherited review remains auditable.
+    bases = {str(base.get('event_id') or base.get('item_id') or base.get('id')): base
+             for base in component.get('base_event_candidates') or []}
+    for event in normalized['events']:
+        if event['action'] != 'extend':
+            continue
+        base = bases[event['base_event_ids'][0]]
+        if append_remaining_chars(base) > 0:
+            continue
+        event['capacity_recovery'] = {'reason': 'append_capacity_exhausted',
+            'base_event_id': event['base_event_ids'][0], 'requested_action': 'extend',
+            'action': 'create'}
+        event.pop('append_only', None)
+        event['action'] = 'create'
+        inherited = set(base['source_message_ids'])
+        event['base_event_ids'] = []
+        event['source_bindings'] = [row for row in event['source_bindings']
+                                   if row['source_message_id'] not in inherited]
+        event['source_message_ids'] = [row['source_message_id'] for row in event['source_bindings']]
+        if 'source_materials' in event:
+            event['source_materials'] = [row for row in event['source_materials']
+                                        if row['source_message_id'] not in inherited]
     return normalized
+
+
+def append_remaining_chars(base):
+    return max(0, EVENT_BODY_ACCEPT_MAX_CHARS - len(str(base.get('body') or '')) - 2)
+
 
 def attachment_references(message: dict[str, Any]) -> list[dict[str, Any]]:
     metadata = message.get('metadata') if isinstance(message.get('metadata'), dict) else {}
