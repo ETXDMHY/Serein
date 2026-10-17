@@ -85,7 +85,8 @@ def initialize(database):
         # failure budget. Retain requests, outputs, provenance and existing holds.
         revision=runtime_revision()
         for row in store.conn.execute("""SELECT * FROM pipeline_batches
-            WHERE status IN ('pending','routing_only','retry_wait')
+            WHERE status IN ('pending','routing_only','retry_wait','needs_repair')
+              AND (status<>'needs_repair' OR COALESCE(json_extract(result_json,'$.repair_kind'),'')<>'runtime_contract')
               AND (json_extract(input_json,'$.contract') IS NULL
                    OR json_extract(input_json,'$.contract')<>?
                    OR json_extract(input_json,'$.runtime_revision') IS NULL
@@ -94,6 +95,8 @@ def initialize(database):
                     'repair_kind':'runtime_contract',
                     'reason':'Frozen runtime contract changed; explicitly review or rebuild the plan.',
                     'note':'原文与已完成输出保留；此聊天暂停，其他聊天可继续。'}
+            if row['status']=='needs_repair':
+                detail['previous_result']=json.loads(row['result_json'] or '{}')
             store.conn.execute("UPDATE pipeline_batches SET status='needs_repair',result_json=? WHERE id=?",
                                (encode(detail),row['id']))
         compact_completed_snapshots(store)
@@ -927,12 +930,31 @@ def validate(request,output):
         raise ValueError('Host Curator omission receipts cannot be submitted by a model')
     if role not in ROLES:raise ValueError('This pipeline stage is retired or unknown; request the next task')
     if request.get('transcription_only'):
-        if set(output)!={'image_transcriptions'}:raise ValueError('补读图片只允许返回转录，不改变 Event 归属')
+        if set(output)!={'image_transcriptions'}:
+            raise ValueError('补读图片只允许返回转录，不改变 Event 归属；顶层只能有 image_transcriptions，'
+                             f"missing={sorted({'image_transcriptions'}-set(output))}, extra={sorted(set(output)-{'image_transcriptions'})}。")
         bind_transcriptions(output,request.get('images',[]));return
     if role in ('event_curator','event_writer') and output.get('context_request') is not None:
         c=output['context_request'];component=request['component']
-        if request.get('context_read') or set(output)!={'context_request'} or not isinstance(c,dict) or set(c)!={'track_id','before_message_id','reason'} or c.get('track_id') not in component['track_ids'] or c.get('before_message_id')!=min(m['id'] for m in component['messages']) or c.get('reason') not in ('missing_subject','missing_origin','missing_prior_claim'):
-            raise ValueError('Only one bounded component context request is allowed')
+        if request.get('context_read'):
+            raise ValueError('此 component 已补读一次，不得再次返回非空 context_request；请返回正常任务结果，证据不足则按证据不足格式返回。')
+        if set(output)!={'context_request'}:
+            raise ValueError('申请补读时顶层只允许 context_request；'
+                             f"请删除额外字段 extra={sorted(set(output)-{'context_request'})}，即使它们为 false、空字符串、空数组或空对象。")
+        if not isinstance(c,dict):
+            raise ValueError('context_request 必须是对象，包含 track_id、before_message_id、reason。')
+        fields={'track_id','before_message_id','reason'}
+        if set(c)!=fields:
+            raise ValueError('context_request 字段不符：'
+                             f'missing={sorted(fields-set(c))}, extra={sorted(set(c)-fields)}。')
+        if c['track_id'] not in component['track_ids']:
+            raise ValueError(f"context_request.track_id 必须属于本 component：allowed={component['track_ids']!r}, received={c['track_id']!r}。")
+        before=min(m['id'] for m in component['messages'])
+        if type(c['before_message_id']) is not int or c['before_message_id']!=before:
+            raise ValueError(f"context_request.before_message_id 必须是本 component 的最小消息 ID：expected={before}, received={c['before_message_id']!r}。")
+        reasons=('missing_subject','missing_origin','missing_prior_claim')
+        if c['reason'] not in reasons:
+            raise ValueError(f"context_request.reason 只能为 {reasons!r}，received={c['reason']!r}。")
         return
     with latest.identity_scope(request['identity']):
         if role=='track_router':
@@ -1103,6 +1125,8 @@ def retry_batch(database,batch_id):
     initialize(database)
     with Store(database) as store,store.transaction(immediate=True):
         row=store.conn.execute('SELECT status FROM pipeline_batches WHERE id=?',(batch_id,)).fetchone()
+        if row is not None and row['status']=='needs_repair':
+            raise ValueError('此批处于 needs_repair，不能使用暂停批次重试；请先重新校验，无法恢复或提示版本变化时明确确认“作废本批计划并重新归线”。')
         if row is None or row['status']!='paused_failure':raise ValueError('找不到暂停的批次')
         for job in store.conn.execute("SELECT id FROM pipeline_jobs WHERE batch_id=? "
                                       "AND (output_json IS NULL OR json_extract(output_json,'$._host_curator_omission') IS NOT NULL)",(batch_id,)):

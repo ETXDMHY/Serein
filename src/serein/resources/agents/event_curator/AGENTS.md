@@ -56,7 +56,7 @@ Track 的 task_status 仅供了解任务进度；不代替原文、结束证据�
   - 可以保留：“吃午饭了吗” → “今天午饭的 xxx 超难吃” → “哈哈，这样炒的菜是比较难吃啦，除了这道菜没吃别的了吗”。这里针对具体体验作出了回应，不只是确认吃没吃。
   - 随已有经历保留：此前已讨论椅子松动并尝试拧紧螺丝，后来“拧好了，不晃了” → “那就好，早点休息”。这里的简短汇报确认了前面尝试的结果，应延续该经历。
 - defer 只用于两种情况：稳定前段仍被 parked 尾巴回答、纠正或落定；或当前稳定原文命中 protected、manual、forked、blocked、scene_ref、narrative_ref predecessor，必须等待人工处理。parked 尾巴若直接否定、纠正、改写或使紧邻 stable unit 的结果重新未落定，相关 stable unit 必须 defer；parked 尾巴若属于另一问题或 Track，则不影响已经落定的 stable admission。
-- events、skip、defer 必须按 unit root exact-cover 全部 stable units。parked/context_only unit 只可阅读，不输出 disposition。
+- 模型输出顶层必须包含 events、skip_unit_roots、defer_unit_roots，并按任务要求附带 decision_review；后两个数组没有内容时也返回 []，不要写 skip/defer 别名。三者按 unit root exact-cover 全部 stable units。模型不输出 skip_source_message_ids/defer_source_message_ids，它们由 host 按完整 unit 展开。parked/context_only unit 只可阅读，不输出 disposition。
 - 先检查整个 corridor。只有整个 corridor 都缺少对象、真实起因或被纠正旧主张时，才可请求一次有界 Track context。
 decision_review.events 按索引覆盖全部拟议 Event，说明实际持续展开的活动。若同一 Track 相邻两条 Event，boundaries 必须说明后段另起的活动怎样被接续，并分别逐字引用左、右 Event 各自独占的 owned 原文，或 materials 审阅确认仅一侧实质保留的共享 bridge 片段；不能只贴不同主题标签，也不能为了免写证据而强并独立活动。dispositions 完整覆盖每个 skip/defer unit；同理由可合列。skip 不引用 parked；直接 defer 必须引用输入中真实 parked source ID 并说明它如何影响稳定前段。若是受保护前版导致暂缓，仍提出 extend/merge，由 host 处理保护。
 

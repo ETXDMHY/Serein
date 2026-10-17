@@ -270,8 +270,13 @@ def _expand_compact_event_curator_output(output: dict[str, Any], component: dict
     defer_roots = unit_roots(raw_defer, 'defer')
     compact_events: list[dict[str, Any]] = []
     for raw_event in raw_events:
-        if not isinstance(raw_event, dict) or set(raw_event) != {'action', 'base_event_ids', 'primary_track_id', 'owned_unit_roots'}:
-            raise ValueError('Track Curator compact Event has invalid fields')
+        if not isinstance(raw_event, dict):
+            raise ValueError('Track Curator compact Event must be an object')
+        fields = {'action', 'base_event_ids', 'primary_track_id', 'owned_unit_roots'}
+        if set(raw_event) != fields:
+            raise ValueError('Track Curator compact Event fields differ: '
+                             f'missing={sorted(fields-set(raw_event))}, unexpected={sorted(set(raw_event)-fields)}; '
+                             'each Event needs action, base_event_ids, primary_track_id, owned_unit_roots')
         owned_roots = unit_roots(raw_event.get('owned_unit_roots'), 'ownership')
         if not owned_roots:
             raise ValueError('Track Curator compact Event needs an owned unit')
@@ -675,8 +680,15 @@ def normalize_event_curator_output(output: dict[str, Any], component: dict[str, 
     review = canonicalize_curator_review(output.get('decision_review'))
     output = {key: value for key, value in output.items() if key != 'decision_review'}
     payload_keys = set(output).difference({'_splitter_provider', '_splitter_model', '_splitter_provider_index', '_track_context_receipt', '_codex_job'})
-    if payload_keys == {'events', 'skip_unit_roots', 'defer_unit_roots'}:
+    compact_keys = {'events', 'skip_unit_roots', 'defer_unit_roots'}
+    expanded_keys = {'events', 'skip_source_message_ids', 'defer_source_message_ids'}
+    if payload_keys == compact_keys:
         output = _expand_compact_event_curator_output(output, component)
+    elif payload_keys != expanded_keys:
+        raise ValueError('Track Curator 模型输出顶层字段不符；模型格式必须包含 '
+                         'events、skip_unit_roots、defer_unit_roots，skip/defer 无内容时也须返回 []；'
+                         f'missing={sorted(compact_keys-payload_keys)}, unexpected={sorted(payload_keys-compact_keys)}。'
+                         'owned_unit_roots/skip_unit_roots/defer_unit_roots 使用输入 unit root；source_message_ids 由 host 展开。')
     normalized = _normalize_expanded_event_curator_output(output, component)
     review = pipeline_materials.merge_review(review, output, component)
     validate_bridge_owners(output, component, review)
@@ -839,7 +851,10 @@ def validate_event_writer_result(result: dict[str, Any], owned_sources: list[dic
         violations.append('evidence_sufficient 缺失或不是布尔值')
     if evidence_sufficient is False:
         if title or body or kept or discarded:
-            violations.append('evidence_sufficient=false 时不得返回 Event 内容')
+            nonempty=[name for name,value in (('title',title),('event_draft',body),
+                       ('kept_details',kept),('discarded_details',discarded)) if value]
+            violations.append('evidence_sufficient=false 时不得返回 Event 内容：'
+                              f'非空字段={nonempty}；title/event_draft 必须为空字符串，kept_details/discarded_details 必须为空数组。')
         if not isinstance(review, dict):
             violations.append('self_review 缺失或不是对象')
         if ('claim_groups' in result or 'sentence_evidence' in result) and (result.get('claim_groups') != [] or result.get('sentence_evidence') != []):
