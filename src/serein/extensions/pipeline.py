@@ -787,7 +787,8 @@ def request_for(database,batch,role,**fields):
                 'recent_context_sha256':digest(encode(request['recent_context'])),
                 'next_track_ordinal':request['next_track_ordinal'],
                 'watermark':settlement_window(request['messages']).isoformat()}
-            prompt=latest.build_event_track_message_prompt(data['day'],request['messages'],request['active_tracks'],recent_context_messages=request['recent_context'],include_role_rules=False)
+            prompt=latest.build_event_track_message_prompt(data['day'],request['messages'],request['active_tracks'],recent_context_messages=request['recent_context'],include_role_rules=False,
+                compact_cards=data.get('input_policy',{}).get('router_compact_cards',False))
         elif role=='event_curator':
             component=fields['component']
             image_messages=image_source_messages(database,component['context_messages'])

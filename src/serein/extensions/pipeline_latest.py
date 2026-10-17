@@ -90,10 +90,11 @@ def event_track_message_payload(messages: list[dict[str, Any]], snowflake_messag
         result.append(projected)
     return result
 
-def build_event_track_message_prompt(date_view: str, block_messages: list[dict[str, Any]], active_tracks: list[dict[str, Any]], snowflake_message_ids: set[int] | None=None, recent_context_messages: list[dict[str, Any]] | None=None, *, include_role_rules: bool=True) -> str:
+def build_event_track_message_prompt(date_view: str, block_messages: list[dict[str, Any]], active_tracks: list[dict[str, Any]], snowflake_message_ids: set[int] | None=None, recent_context_messages: list[dict[str, Any]] | None=None, *, include_role_rules: bool=True, compact_cards: bool=False) -> str:
     prompt_tracks = []
     for track in active_tracks:
-        item = {key: track.get(key) for key in ('track_id', 'subject', 'throughline', 'status', 'task_status', 'recent_turns') if track.get(key) not in (None, '', [])}
+        item = {key: track.get(key) for key in ('track_id', 'subject', 'throughline', 'status', 'task_status', 'recent_turns')
+                if track.get(key) not in (None, '', []) and (key != 'recent_turns' or not compact_cards)}
         item['event_policy'] = str(track.get('event_policy') or 'default')
         prompt_tracks.append(item)
     source_ids = [int(message['id']) for message in block_messages]
